@@ -11,7 +11,10 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -23,6 +26,306 @@ import (
 	"github.com/mattermost/platform/store"
 	"github.com/mattermost/platform/utils"
 )
+
+func getMockContext() *Context {
+	return &Context{
+		RequestId: model.NewId(),
+		IpAddress: "tests",
+		T:         utils.TfuncWithFallback(model.DEFAULT_LOCALE),
+		Locale:    model.DEFAULT_LOCALE,
+	}
+}
+
+// usage: at the beginning of a test function, use defer as follows (note the
+// double ()):
+// defer backupAndRestoreCfg()()
+// backupAndRestoreCfg() will be evaluated when the defer executes, not when
+// the call executes, thus backuping the config when defer executes. Before the
+// calling function returns, the config will be restored.
+func backupAndRestoreCfg() func() {
+	oldCfg := *utils.Cfg
+	return func() { utils.Cfg = &oldCfg }
+}
+
+func invitationLinkDateString(valid bool) string {
+	// TODO: the validity period should be a constant somewhere
+	var daysAgo time.Duration
+	if valid {
+		daysAgo = time.Hour * 24 * 1
+	} else {
+		daysAgo = time.Hour * 24 * 3
+	}
+	date := time.Now().Add(-daysAgo).UnixNano() / int64(time.Millisecond)
+	return strconv.FormatInt(date, 10)
+}
+
+func TestUser_createUser_emailDisabled(t *testing.T) {
+	defer backupAndRestoreCfg()()
+	c := getMockContext()
+	w := httptest.NewRecorder()
+	r, err := http.NewRequest("POST", "http://example.com", nil)
+	if err != nil {
+		t.Fatal("Couldn't create a request: ", err)
+	}
+
+	flagsList := []struct {
+		EnableSignUpWithEmail bool
+		EnableUserCreation    bool
+	}{
+		{true, false},
+		{false, true},
+		{false, false},
+	}
+
+	for _, flags := range flagsList {
+		currentTest := fmt.Sprintf("EnableSignUpWithEmail: %t, EnableUserCreation: %t",
+			flags.EnableSignUpWithEmail, flags.EnableUserCreation)
+		utils.Cfg.EmailSettings.EnableSignUpWithEmail = flags.EnableSignUpWithEmail
+		utils.Cfg.TeamSettings.EnableUserCreation = flags.EnableUserCreation
+		createUser(c, w, r)
+		if c.Err == nil {
+			t.Fatalf("c.Err shouldn't be nil for %s", currentTest)
+		}
+		if got, want := c.Err.StatusCode, http.StatusNotImplemented; got != want {
+			t.Fatalf("StatusCode, got: %v, want: %v for %s", got, want, currentTest)
+		}
+	}
+}
+
+func TestUser_createUser_invalidLink(t *testing.T) {
+	defer backupAndRestoreCfg()()
+	utils.Cfg.EmailSettings.EnableSignUpWithEmail = true
+	utils.Cfg.TeamSettings.EnableUserCreation = true
+	utils.Cfg.EmailSettings.InviteSalt = "fake salt"
+	c := getMockContext()
+	w := httptest.NewRecorder()
+	u, err := url.Parse("https://example.com")
+	if err != nil {
+		t.Fatal("Couldn't create URL: ", err)
+	}
+	// make sure hash comparison will fail
+	v := url.Values{}
+	v.Set("h", "fake hash")
+	v.Set("d", "fake data")
+	u.RawQuery = v.Encode()
+	r, err := http.NewRequest("POST", u.String(), strings.NewReader("{}"))
+	if err != nil {
+		t.Fatal("Couldn't create a request: ", err)
+	}
+
+	createUser(c, w, r)
+	if c.Err == nil {
+		t.Fatalf("c.Err shouldn't be nil")
+	}
+	if got, want := c.Err.Id, "api.user.create_user.signup_link_invalid.app_error"; got != want {
+		t.Fatalf("c.Err.Id, got: %v, want: %v", got, want)
+	}
+}
+
+func TestUser_createUser_expiredLink(t *testing.T) {
+	defer backupAndRestoreCfg()()
+	utils.Cfg.EmailSettings.EnableSignUpWithEmail = true
+	utils.Cfg.TeamSettings.EnableUserCreation = true
+	utils.Cfg.EmailSettings.InviteSalt = "fake salt"
+	c := getMockContext()
+	w := httptest.NewRecorder()
+	u, err := url.Parse("https://example.com")
+	if err != nil {
+		t.Fatal("Couldn't create URL: ", err)
+	}
+	// make sure the link is expired
+	d := `{"display_name":"teamName","email":"fake@example.com","id":"aFakeTeamID","name":"teamName","time":"` + invitationLinkDateString(false) + `"}`
+	// make sure hash comparison succeeds
+	h := model.HashPassword(fmt.Sprintf("%v:%v", d, utils.Cfg.EmailSettings.InviteSalt))
+	v := url.Values{}
+	v.Set("h", h)
+	v.Set("d", d)
+	u.RawQuery = v.Encode()
+	r, err := http.NewRequest("POST", u.String(), strings.NewReader("{}"))
+	if err != nil {
+		t.Fatal("Couldn't create a request: ", err)
+	}
+
+	createUser(c, w, r)
+	if c.Err == nil {
+		t.Fatalf("c.Err shouldn't be nil")
+	}
+	if got, want := c.Err.Id, "api.user.create_user.signup_link_expired.app_error"; got != want {
+		t.Fatalf("c.Err.Id, got: %v, want: %v", got, want)
+	}
+}
+
+func TestUser_createUser_invalidTeamID(t *testing.T) {
+	Setup()
+	defer backupAndRestoreCfg()()
+	utils.Cfg.EmailSettings.EnableSignUpWithEmail = true
+	utils.Cfg.TeamSettings.EnableUserCreation = true
+	utils.Cfg.EmailSettings.InviteSalt = "fake salt"
+	c := getMockContext()
+	w := httptest.NewRecorder()
+	u, err := url.Parse("https://example.com")
+	if err != nil {
+		t.Fatal("Couldn't create URL: ", err)
+	}
+	// make sure the link is not expired
+	d := `{"display_name":"teamName","email":"fake@example.com","id":"aFakeTeamID","name":"teamName","time":"` + invitationLinkDateString(true) + `"}`
+	// make sure hash comparison succeeds
+	h := model.HashPassword(fmt.Sprintf("%v:%v", d, utils.Cfg.EmailSettings.InviteSalt))
+	v := url.Values{}
+	v.Set("h", h)
+	v.Set("d", d)
+	u.RawQuery = v.Encode()
+	r, err := http.NewRequest("POST", u.String(), strings.NewReader("{}"))
+	if err != nil {
+		t.Fatal("Couldn't create a request: ", err)
+	}
+
+	createUser(c, w, r)
+	if c.Err == nil {
+		t.Fatalf("c.Err shouldn't be nil")
+	}
+	if got, want := c.Err.Where, "SqlTeamStore.Get"; got != want {
+		t.Fatalf("c.Err.Where, got: %v, want: %v", got, want)
+	}
+}
+
+func TestUser_createUser_invalidInviteID(t *testing.T) {
+	Setup()
+	defer backupAndRestoreCfg()()
+	utils.Cfg.EmailSettings.EnableSignUpWithEmail = true
+	utils.Cfg.TeamSettings.EnableUserCreation = true
+	utils.Cfg.EmailSettings.InviteSalt = "fake salt"
+	c := getMockContext()
+	w := httptest.NewRecorder()
+	u, err := url.Parse("https://example.com")
+	if err != nil {
+		t.Fatal("Couldn't create URL: ", err)
+	}
+	// make sure there's an invite ID and nothing else
+	v := url.Values{}
+	v.Set("iid", "fake invite id")
+	u.RawQuery = v.Encode()
+	r, err := http.NewRequest("POST", u.String(), strings.NewReader("{}"))
+	if err != nil {
+		t.Fatal("Couldn't create a request: ", err)
+	}
+
+	createUser(c, w, r)
+	if c.Err == nil {
+		t.Fatalf("c.Err shouldn't be nil")
+	}
+	if got, want := c.Err.Where, "SqlTeamStore.GetByInviteId"; got != want {
+		t.Fatalf("c.Err.Where, got: %v, want: %v", got, want)
+	}
+}
+
+func TestUser_createUser_invalidDomain(t *testing.T) {
+	th := Setup()
+	Client := th.CreateClient()
+
+	defer backupAndRestoreCfg()()
+	utils.Cfg.EmailSettings.EnableSignUpWithEmail = true
+	utils.Cfg.TeamSettings.EnableUserCreation = true
+	utils.Cfg.EmailSettings.InviteSalt = "fake salt"
+	utils.Cfg.TeamSettings.RestrictCreationToDomains = "mattermost.org"
+
+	inviteID := model.NewId()
+	team := &model.Team{
+		DisplayName: "Name",
+		Name:        "z-z-" + model.NewId() + "a",
+		Email:       "test@mattermost.org",
+		Type:        model.TEAM_OPEN,
+		InviteId:    inviteID,
+	}
+	rteam, err1 := Client.CreateTeam(team)
+	if err1 != nil {
+		t.Fatal("Couldn't create team: ", err1)
+	}
+	team = rteam.Data.(*model.Team)
+
+	c := getMockContext()
+	w := httptest.NewRecorder()
+
+	u, err := url.Parse("https://example.com")
+	if err != nil {
+		t.Fatal("Couldn't create URL: ", err)
+	}
+
+	// make sure the link is not expired and the domain is not in the restricted list
+	d := `{"display_name":"teamName","email":"fake@example.com","id":"` + team.Id + `","name":"teamName","time":"` + invitationLinkDateString(true) + `"}`
+	// make sure hash comparison succeeds
+	h := model.HashPassword(fmt.Sprintf("%v:%v", d, utils.Cfg.EmailSettings.InviteSalt))
+	v := url.Values{}
+	v.Set("h", h)
+	v.Set("d", d)
+	v.Set("iid", team.InviteId)
+	u.RawQuery = v.Encode()
+	r, err := http.NewRequest("POST", u.String(), strings.NewReader("{}"))
+	if err != nil {
+		t.Fatal("Couldn't create a request: ", err)
+	}
+
+	createUser(c, w, r)
+	if c.Err == nil {
+		t.Fatalf("c.Err shouldn't be nil")
+	}
+	if got, want := c.Err.Id, "api.user.create_user.accepted_domain.app_error"; got != want {
+		t.Fatalf("c.Err.Id, got: %v, want: %v", got, want)
+	}
+}
+
+func TestUser_createUser(t *testing.T) {
+	th := Setup()
+	Client := th.CreateClient()
+
+	defer backupAndRestoreCfg()()
+	utils.Cfg.EmailSettings.EnableSignUpWithEmail = true
+	utils.Cfg.TeamSettings.EnableUserCreation = true
+	utils.Cfg.EmailSettings.InviteSalt = "fake salt"
+
+	inviteID := model.NewId()
+	team := &model.Team{
+		DisplayName: "Name",
+		Name:        "z-z-" + model.NewId() + "a",
+		Email:       "test@example.org",
+		Type:        model.TEAM_OPEN,
+		InviteId:    inviteID,
+	}
+	rteam, err1 := Client.CreateTeam(team)
+	if err1 != nil {
+		t.Fatal("Couldn't create team: ", err1)
+	}
+	team = rteam.Data.(*model.Team)
+
+	c := getMockContext()
+	w := httptest.NewRecorder()
+
+	u, err := url.Parse("https://example.com")
+	if err != nil {
+		t.Fatal("Couldn't create URL: ", err)
+	}
+
+	d := `{"display_name":"teamName","email":"fake+` + model.NewId() + `@example.com","id":"` + team.Id + `","name":"teamName","time":"` + invitationLinkDateString(true) + `"}`
+	// make sure hash comparison succeeds
+	h := model.HashPassword(fmt.Sprintf("%v:%v", d, utils.Cfg.EmailSettings.InviteSalt))
+	v := url.Values{}
+	v.Set("h", h)
+	v.Set("d", d)
+	v.Set("iid", team.InviteId)
+	u.RawQuery = v.Encode()
+	r, err := http.NewRequest("POST", u.String(), strings.NewReader("{}"))
+	if err != nil {
+		t.Fatal("Couldn't create a request: ", err)
+	}
+
+	createUser(c, w, r)
+	if c.Err != nil {
+		t.Fatalf("c.Err should be nil but is %v", c.Err)
+	}
+	if got, want := w.Code, http.StatusOK; got != want {
+		t.Fatalf("StatusCode, got: %v, want: %v", got, want)
+	}
+}
 
 func TestCreateUser(t *testing.T) {
 	th := Setup()
