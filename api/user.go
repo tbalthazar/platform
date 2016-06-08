@@ -73,87 +73,149 @@ func InitUser() {
 	BaseRoutes.NeedUser.Handle("/image", ApiUserRequiredTrustRequester(getProfileImage)).Methods("GET")
 }
 
+func isEmailSignupEnabled() *model.AppError {
+	if !utils.Cfg.EmailSettings.EnableSignUpWithEmail ||
+		!utils.Cfg.TeamSettings.EnableUserCreation {
+		err := model.NewLocAppError(
+			"signupTeam",
+			"api.user.create_user.signup_email_disabled.app_error",
+			nil,
+			"",
+		)
+		err.StatusCode = http.StatusNotImplemented
+		return err
+	}
+	return nil
+}
+
+func getTeamInviteInfo(
+	u *url.URL,
+	team *model.Team,
+	user *model.User,
+) (bool, *model.AppError) {
+	hash := u.Query().Get("h")
+	if len(hash) == 0 {
+		return false, nil
+	}
+
+	data := u.Query().Get("d")
+	props := model.MapFromJson(strings.NewReader(data))
+	hashedData := fmt.Sprintf("%v:%v", data, utils.Cfg.EmailSettings.InviteSalt)
+
+	if !model.ComparePassword(hash, hashedData) {
+		return false, model.NewLocAppError(
+			"createUser",
+			"api.user.create_user.signup_link_invalid.app_error",
+			nil,
+			"",
+		)
+	}
+
+	t, err := strconv.ParseInt(props["time"], 10, 64)
+	if err != nil || model.GetMillis()-t > 1000*60*60*48 { // 48 hours
+		return false, model.NewLocAppError(
+			"createUser",
+			"api.user.create_user.signup_link_expired.app_error",
+			nil,
+			"",
+		)
+	}
+
+	// try to load the team to make sure it exists
+	result := <-Srv.Store.Team().Get(props["id"])
+	if result.Err != nil {
+		return false, result.Err
+	}
+	team = result.Data.(*model.Team)
+
+	user.Email = props["email"]
+	user.EmailVerified = true
+	return true, nil
+}
+
+func getTeamInviteLinkInfo(
+	u *url.URL,
+	team *model.Team,
+) *model.AppError {
+	inviteId := u.Query().Get("iid")
+	if len(inviteId) == 0 {
+		return nil
+	}
+	result := <-Srv.Store.Team().GetByInviteId(inviteId)
+	if result.Err != nil {
+		return result.Err
+	}
+	team = result.Data.(*model.Team)
+	return nil
+}
+
+func isFirstAccount() (bool, *model.AppError) {
+	if sessionCache.Len() > 0 {
+		return false, nil
+	}
+
+	cr := <-Srv.Store.User().GetTotalUsersCount()
+	if cr.Err != nil {
+		return false, cr.Err
+	}
+
+	return cr.Data.(int64) <= 0, nil
+}
+
 func createUser(c *Context, w http.ResponseWriter, r *http.Request) {
-	if !utils.Cfg.EmailSettings.EnableSignUpWithEmail || !utils.Cfg.TeamSettings.EnableUserCreation {
-		c.Err = model.NewLocAppError("signupTeam", "api.user.create_user.signup_email_disabled.app_error", nil, "")
-		c.Err.StatusCode = http.StatusNotImplemented
+	if err := isEmailSignupEnabled(); err != nil {
+		c.Err = err
 		return
 	}
 
+	var team *model.Team
 	user := model.UserFromJson(r.Body)
-
 	if user == nil {
 		c.SetInvalidParam("createUser", "user")
 		return
 	}
-
-	hash := r.URL.Query().Get("h")
-	teamId := ""
-	var team *model.Team
-	shouldSendWelcomeEmail := true
 	user.EmailVerified = false
 
-	if len(hash) > 0 {
-		data := r.URL.Query().Get("d")
-		props := model.MapFromJson(strings.NewReader(data))
+	isInvited, err := getTeamInviteInfo(r.URL, team, user)
+	if err != nil {
+		c.Err = err
+		return
+	}
+	// if the user has been invited, we do not send him a welcome email because
+	// he already received one when he was invited.
+	shouldSendWelcomeEmail := !isInvited
 
-		if !model.ComparePassword(hash, fmt.Sprintf("%v:%v", data, utils.Cfg.EmailSettings.InviteSalt)) {
-			c.Err = model.NewLocAppError("createUser", "api.user.create_user.signup_link_invalid.app_error", nil, "")
-			return
-		}
-
-		t, err := strconv.ParseInt(props["time"], 10, 64)
-		if err != nil || model.GetMillis()-t > 1000*60*60*48 { // 48 hours
-			c.Err = model.NewLocAppError("createUser", "api.user.create_user.signup_link_expired.app_error", nil, "")
-			return
-		}
-
-		teamId = props["id"]
-
-		// try to load the team to make sure it exists
-		if result := <-Srv.Store.Team().Get(teamId); result.Err != nil {
-			c.Err = result.Err
-			return
-		} else {
-			team = result.Data.(*model.Team)
-		}
-
-		user.Email = props["email"]
-		user.EmailVerified = true
-		shouldSendWelcomeEmail = false
+	err = getTeamInviteLinkInfo(r.URL, team)
+	if err != nil {
+		c.Err = err
+		return
 	}
 
-	inviteId := r.URL.Query().Get("iid")
-	if len(inviteId) > 0 {
-		if result := <-Srv.Store.Team().GetByInviteId(inviteId); result.Err != nil {
-			c.Err = result.Err
-			return
-		} else {
-			team = result.Data.(*model.Team)
-			teamId = team.Id
-		}
+	firstAccount, err := isFirstAccount()
+	if err != nil {
+		c.Err = err
+		return
 	}
 
-	firstAccount := false
-	if sessionCache.Len() == 0 {
-		if cr := <-Srv.Store.User().GetTotalUsersCount(); cr.Err != nil {
-			c.Err = cr.Err
-			return
-		} else {
-			count := cr.Data.(int64)
-			if count <= 0 {
-				firstAccount = true
-			}
-		}
-	}
-
-	if !firstAccount && !*utils.Cfg.TeamSettings.EnableOpenServer && len(teamId) == 0 {
-		c.Err = model.NewLocAppError("createUser", "api.user.create_user.no_open_server", nil, "email="+user.Email)
+	if !firstAccount &&
+		!*utils.Cfg.TeamSettings.EnableOpenServer &&
+		team == nil {
+		c.Err = model.NewLocAppError(
+			"createUser",
+			"api.user.create_user.no_open_server",
+			nil,
+			"email="+user.Email,
+		)
 		return
 	}
 
 	if !CheckUserDomain(user, utils.Cfg.TeamSettings.RestrictCreationToDomains) {
-		c.Err = model.NewLocAppError("createUser", "api.user.create_user.accepted_domain.app_error", nil, "")
+		c.Err = model.NewLocAppError(
+			"createUser",
+			"api.user.create_user.accepted_domain.app_error",
+			nil,
+			"",
+		)
 		return
 	}
 
@@ -163,7 +225,7 @@ func createUser(c *Context, w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if len(teamId) > 0 {
+	if team != nil {
 		err := JoinUserToTeam(team, ruser)
 		if err != nil {
 			c.Err = err
@@ -178,7 +240,6 @@ func createUser(c *Context, w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Write([]byte(ruser.ToJson()))
-
 }
 
 func CheckUserDomain(user *model.User, domains string) bool {
